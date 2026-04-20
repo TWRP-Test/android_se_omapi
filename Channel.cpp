@@ -3,20 +3,18 @@
 
 namespace aidl::android::se {
 
-Channel::Channel(ISecureElementSession* session, 
+Channel::Channel(ISecureElementSession* session,
             Terminal* terminal,
             int channelNumber,
             const std::vector<uint8_t>& selectResponse,
             const std::vector<uint8_t>& aid,
-            const std::shared_ptr<ISecureElementListener>& listener,
-            int callingPid)
+            const std::shared_ptr<ISecureElementListener>& listener)
     : mSession(session),
       mTerminal(terminal),
       mChannelNumber(channelNumber),
       mSelectResponse(selectResponse),
       mAid(aid),
-      mListener(listener),
-      mCallingPid(callingPid){};
+      mListener(listener) {}
 
 int Channel::getChannelNumber() const {
     LOG(INFO) << "Channel number: " << mChannelNumber;
@@ -60,13 +58,26 @@ std::vector<uint8_t> Channel::getSelectResponse() {
 }
 
 std::vector<uint8_t> Channel::transmit(const std::vector<uint8_t>& command) {
-    std::vector<uint8_t> modifiedCommand = command;
-
-    if (modifiedCommand.empty()) {
-        LOG(ERROR) << "Channel " << mChannelNumber << ": Command is empty after checks.";
+    if (command.size() < 4) {
+        LOG(ERROR) << "Channel " << mChannelNumber << ": APDU too short";
         return {};
     }
 
+    const uint8_t cla = command[0];
+    const uint8_t ins = command[1];
+
+    // Block MANAGE CHANNEL (OMAPI/SEAC).
+    if (ins == 0x70) {
+        LOG(ERROR) << "Channel " << mChannelNumber << ": MANAGE CHANNEL blocked";
+        return {};
+    }
+    // Block ISO-reserved CLA=0xFF with INS 0x6X/0x9X.
+    if (cla == 0xFF && ((ins & 0xF0) == 0x60 || (ins & 0xF0) == 0x90)) {
+        LOG(ERROR) << "Channel " << mChannelNumber << ": reserved CLA/INS blocked";
+        return {};
+    }
+
+    std::vector<uint8_t> modifiedCommand = command;
     uint8_t originalCla = modifiedCommand[0];
     uint8_t newCla = originalCla;
 

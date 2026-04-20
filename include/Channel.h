@@ -13,29 +13,20 @@ using aidl::android::se::omapi::ISecureElementListener;
 using aidl::android::se::omapi::ISecureElementSession;
 
 namespace aidl::android::se {
-// namespace omapi {
-// class SecureElementSession;
-// }
-// using aidl::android::se::omapi::SecureElementSession;
 
 class Channel : public ::android::RefBase {
     public:
-        Channel(ISecureElementSession* session, 
+        Channel(ISecureElementSession* session,
             Terminal* terminal,
             int channelNumber,
             const std::vector<uint8_t>& selectResponse,
             const std::vector<uint8_t>& aid,
-            const std::shared_ptr<ISecureElementListener>& listener,
-            int callingPid);
+            const std::shared_ptr<ISecureElementListener>& listener);
 
         virtual ~Channel() = default;
 
-        void binderDied();
         void close();
         std::vector<uint8_t> transmit(const std::vector<uint8_t>& command);
-        // std::shared_ptr<ChannelAccess> getChannelAccess();
-        // void setChannelAccess(std::shared_ptr<ChannelAccess> channelAccess);
-        bool hasSelectedAid();
         int getChannelNumber() const;
         std::vector<uint8_t> getSelectResponse();
         bool isBasicChannel();
@@ -48,11 +39,8 @@ class Channel : public ::android::RefBase {
         std::vector<uint8_t> mSelectResponse;
         std::vector<uint8_t> mAid;
         const std::shared_ptr<ISecureElementListener> mListener;
-        int mCallingPid;
-         uint8_t internalGetModifiedCla(uint8_t originalCla, int channelNumber) const;
-        void setCallingPid(int pid);
-        void checkCommand(std::vector<uint8_t>& command);
-        bool mIsClosed;
+        uint8_t internalGetModifiedCla(uint8_t originalCla, int channelNumber) const;
+        bool mIsClosed = false;
         friend class SecureElementChannel;
     };
     class SecureElementChannel : public BnSecureElementChannel {

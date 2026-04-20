@@ -9,35 +9,40 @@
 #include <android/binder_manager.h>
 #include <aidl/android/hardware/secure_element/LogicalChannelResponse.h>
 
+#include <chrono>
+#include <thread>
+
 namespace aidl::android::se {
 using aidl::android::se::omapi::SecureElementSession;
 
-void Terminal::onClientDeath(void* cookie) {
+void Terminal::onClientDeath() {
     LOG(INFO) << __func__ << ": Die";
-    SecureElementSession* session = static_cast<SecureElementSession*>(cookie);
-    // if (session && !session->isClosed()) {
-    //     session->close();
-    // }
     mIsConnected = false;
-    // if (mAccessControlEnforcer != nullptr) {
-    //     mAccessControlEnforcer.reset();
-    // }
     this->handler(EVENT_GET_HAL, 0, GET_SERVICE_DELAY_MILLIS);
 }
 
 void Terminal::onClientDeathWrapper(void* cookie) {
     LOG(INFO) << "Binder has died";
     Terminal* self = static_cast<Terminal*>(cookie);
-    self->onClientDeath(cookie);
+    self->onClientDeath();
 }
 
 Terminal::AidlCallback::AidlCallback(Terminal* terminal) {
-        mTerminal = terminal;
+    mTerminal = terminal;
 }
 
 ::ndk::ScopedAStatus Terminal::AidlCallback::onStateChange(bool state, const std::string& debugReason) {
-    mTerminal->stateChange(state, debugReason);
+    Terminal* t = mTerminal;
+    if (t == nullptr) {
+        LOG(WARNING) << __func__ << ": Terminal gone, ignoring state change";
+        return ::ndk::ScopedAStatus::ok();
+    }
+    t->stateChange(state, debugReason);
     return ::ndk::ScopedAStatus::ok();
+}
+
+void Terminal::AidlCallback::clearTerminal() {
+    mTerminal = nullptr;
 }
 
 Terminal::Terminal(const std::string name) {
@@ -46,24 +51,34 @@ Terminal::Terminal(const std::string name) {
     mAidlCallback = ndk::SharedRefBase::make<AidlCallback>(this);
 }
 
-std::string Terminal::getName() {
+Terminal::~Terminal() {
+    if (mAidlCallback != nullptr) {
+        mAidlCallback->clearTerminal();
+    }
+    if (mAidlHal != nullptr) {
+        AIBinder* binder = mAidlHal->asBinder().get();
+        if (binder) {
+            AIBinder_unlinkToDeath(binder, mDeathRecipient, this);
+        }
+    }
+    if (mDeathRecipient != nullptr) {
+        AIBinder_DeathRecipient_delete(mDeathRecipient);
+        mDeathRecipient = nullptr;
+    }
+}
+
+std::string Terminal::getName() const {
     return mName;
 }
 
 void Terminal::stateChange(bool state, const std::string& reason) {
     LOG(INFO) << __func__ << ": state: " << state << ", reason: " << reason;
-    //std::lock_guard<std::mutex> lock(mLock);
     mIsConnected = state;
     if (!state) {
         LOG(INFO) << "state: not connected";
-        // if (mAccessControlEnforcer != nullptr) {
-        //     mAccessControlEnforcer->reset();
-        // }
     } else {
         LOG(INFO) << "state: connected";
-        /* Unimplemented yet */
         this->closeChannels();
-        //initializeAccessControl();
         mDefaultApplicationSelectedOnBasicChannel = true;
     }
     this->handler(EVENT_NOTIFY_STATE_CHANGE, state, 0);
@@ -72,38 +87,64 @@ void Terminal::stateChange(bool state, const std::string& reason) {
 std::vector<uint8_t> Terminal::transmit(const std::vector<uint8_t>& cmd) {
     LOG(INFO) << __func__;
     std::lock_guard<std::mutex> lock(mLock);
-    
+
     if (!mIsConnected) {
         return {};
     }
 
-    std::vector<uint8_t> response;
-    if (mAidlHal != nullptr) {
-        mAidlHal->transmit(cmd, &response);
-    }
-
-    if (response.size() == 0) {
-        LOG(ERROR) << "Empty response in transmit()";
+    if (mAidlHal == nullptr) {
+        LOG(ERROR) << __func__ << ": mAidlHal is null";
         return {};
     }
 
-    size_t len = response.size();
-    uint8_t sw1 = len >= 2 ? response[len-2] : 0;
-    uint8_t sw2 = len >= 1 ? response[len-1] : 0;
+    std::vector<uint8_t> response;
+    ndk::ScopedAStatus hal_status = mAidlHal->transmit(cmd, &response);
+    if (!hal_status.isOk()) {
+        LOG(ERROR) << __func__ << ": HAL transmit failed: " << hal_status.getDescription();
+        return {};
+    }
+
+    if (response.size() < 2) {
+        LOG(ERROR) << "Empty or too short response in transmit()";
+        return {};
+    }
+
+    uint8_t sw1 = response[response.size() - 2];
+    uint8_t sw2 = response[response.size() - 1];
 
     if (sw1 == 0x6C) {
         std::vector<uint8_t> newCmd(cmd);
         newCmd.back() = sw2;
-        return transmit(newCmd);
-    } else if (sw1 == 0x61) {
-        do {
+        std::vector<uint8_t> tmp;
+        ndk::ScopedAStatus s = mAidlHal->transmit(newCmd, &tmp);
+        if (!s.isOk()) {
+            LOG(ERROR) << __func__ << ": retry after 6CXX failed: " << s.getDescription();
+            return {};
+        }
+        return tmp;
+    }
+
+    if (sw1 == 0x61) {
+        response.resize(response.size() - 2);
+        while (true) {
             std::vector<uint8_t> getResponseCmd = {cmd[0], 0xC0, 0x00, 0x00, sw2};
-            auto tmp = transmit(getResponseCmd);
-            
-            response.insert(response.end()-2, tmp.begin(), tmp.end()-2);
-            sw1 = tmp[tmp.size()-2];
-            sw2 = tmp[tmp.size()-1];
-        } while (sw1 == 0x61);
+            std::vector<uint8_t> tmp;
+            ndk::ScopedAStatus s = mAidlHal->transmit(getResponseCmd, &tmp);
+            if (!s.isOk() || tmp.size() < 2) {
+                LOG(ERROR) << __func__ << ": GET RESPONSE failed";
+                return {};
+            }
+            uint8_t nextSw1 = tmp[tmp.size() - 2];
+            uint8_t nextSw2 = tmp[tmp.size() - 1];
+            response.insert(response.end(), tmp.begin(), tmp.end() - 2);
+            if (nextSw1 == 0x61) {
+                sw2 = nextSw2;
+                continue;
+            }
+            response.push_back(nextSw1);
+            response.push_back(nextSw2);
+            break;
+        }
     }
 
     return response;
@@ -131,69 +172,78 @@ void Terminal::initialize(bool retryOnFail) {
 
 std::shared_ptr<ISecureElementReader> Terminal::newSecureElementReader(std::shared_ptr<omapi::SecureElementService> service) {
     LOG(INFO) << __func__;
-    return ndk::SharedRefBase::make<SecureElementReader>(service, this);
+    return ndk::SharedRefBase::make<SecureElementReader>(service, ::android::sp<Terminal>(this));
 }
 
-std::shared_ptr<Channel> Terminal::openBasicChannel(ISecureElementSession* session, const std::vector<uint8_t>& aid, uint8_t p2, const std::shared_ptr<ISecureElementListener>& listener, const std::string& packageName, const std::vector<uint8_t>& uuid, int pid) {
+std::shared_ptr<Channel> Terminal::openBasicChannel(ISecureElementSession* session, const std::vector<uint8_t>& aid, uint8_t p2, const std::shared_ptr<ISecureElementListener>& listener) {
     LOG(INFO) << __func__;
-    LOG(ERROR) << __func__ << " 还没写";
-    return nullptr;
-}
-
-std::shared_ptr<Channel> Terminal::openLogicalChannel(ISecureElementSession* session, const std::vector<uint8_t>& aid, uint8_t p2, const std::shared_ptr<ISecureElementListener>& listener, const std::string& packageName, const std::vector<uint8_t>& uuid, int pid) {
-    LOG(INFO) << __func__;
-    // LOG(ERROR) << __func__ << " 还没写";
-    if (aid.empty()) {
-        LOG(INFO) << __func__ << ": AID is empty";
-    } else if (aid.size() < 5 || aid.size() > 16) {
-        LOG(ERROR) << ": AID out of range";
+    if (!aid.empty() && (aid.size() < 5 || aid.size() > 16)) {
+        LOG(ERROR) << __func__ << ": AID out of range";
         return nullptr;
-    } else if (!mIsConnected) {
+    }
+    if (!mIsConnected) {
         LOG(ERROR) << __func__ << ": SE is not connected";
         return nullptr;
     }
 
-    if (packageName != "") {
-        LOG(WARNING) << __func__ << ": Enable access control on logical channel for: " << packageName;
-    } else if (!uuid.empty()) {
-        LOG(WARNING) << __func__ << ": Enable access control on logical channel for uid: " << pid << ", uuid: " << hex2string(uuid);
-    }
-
-    if (packageName != "" || !uuid.empty()) {
-        LOG(ERROR) << __func__ << ": setUpChannelAccess 没写";
-        // channelAccess = setUpChannelAccess(aid, packageName, uuid, pid, false);
-    }
-
     std::lock_guard<std::mutex> lock(mLock);
-    // int* status = int[1];
-    // status[0] = 0;
-    if (mAidlHal != nullptr) {
-        // response[0] = new LogicalChannelResponse();
-        ::aidl::android::hardware::secure_element::LogicalChannelResponse* responseArray =
-            new ::aidl::android::hardware::secure_element::LogicalChannelResponse[1];
-        ::aidl::android::hardware::secure_element::LogicalChannelResponse aidlRs;
-        ndk::ScopedAStatus oStatus = mAidlHal->openLogicalChannel(aid.empty() ? std::vector<uint8_t>() : aid, p2, &aidlRs);
-        if (!oStatus.isOk()) {
-            LOG(ERROR) << __func__ << ": openLogicalChannel failed: " << oStatus.getDescription();
-            delete[] responseArray;
-            return nullptr;
-        } else {
-            responseArray[0] = aidlRs;
-            int channelNumber = responseArray[0].channelNumber;
-            std::vector<uint8_t> selectResponse = responseArray[0].selectResponse;
-            LOG(INFO) << __func__ << ": Channel number: " << channelNumber << ", select response: " << hex2string(selectResponse);
-            // Create a std::shared_ptr for the new Channel
-            auto logicalChannel = std::shared_ptr<Channel>(new Channel(session, this, channelNumber, selectResponse, aid, listener, pid));
-            mChannels.insert(std::make_pair(channelNumber, logicalChannel));
-            delete[] responseArray;
-            return logicalChannel;
-        }
-    } else {
-        LOG(ERROR) << __func__ << ": Can't find mAidlHal, and don't support HIDL hal, returning...";
+    if (mAidlHal == nullptr) {
+        LOG(ERROR) << __func__ << ": mAidlHal is null";
         return nullptr;
     }
 
-    return nullptr;
+    if (mChannels.count(0) > 0) {
+        LOG(ERROR) << __func__ << ": basic channel already in use";
+        return nullptr;
+    }
+
+    std::vector<uint8_t> selectResponse;
+    ndk::ScopedAStatus oStatus =
+        mAidlHal->openBasicChannel(aid.empty() ? std::vector<uint8_t>() : aid, p2, &selectResponse);
+    if (!oStatus.isOk()) {
+        LOG(ERROR) << __func__ << ": openBasicChannel HAL call failed: " << oStatus.getDescription();
+        return nullptr;
+    }
+
+    LOG(INFO) << __func__ << ": basic channel opened, select response: " << hex2string(selectResponse);
+    auto basicChannel = std::make_shared<Channel>(session, this, 0, selectResponse, aid, listener);
+    mChannels.insert(std::make_pair(0, basicChannel));
+    mDefaultApplicationSelectedOnBasicChannel = false;
+    return basicChannel;
+}
+
+std::shared_ptr<Channel> Terminal::openLogicalChannel(ISecureElementSession* session, const std::vector<uint8_t>& aid, uint8_t p2, const std::shared_ptr<ISecureElementListener>& listener) {
+    LOG(INFO) << __func__;
+    if (!aid.empty() && (aid.size() < 5 || aid.size() > 16)) {
+        LOG(ERROR) << __func__ << ": AID out of range";
+        return nullptr;
+    }
+    if (!mIsConnected) {
+        LOG(ERROR) << __func__ << ": SE is not connected";
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(mLock);
+    if (mAidlHal == nullptr) {
+        LOG(ERROR) << __func__ << ": mAidlHal is null";
+        return nullptr;
+    }
+
+    ::aidl::android::hardware::secure_element::LogicalChannelResponse aidlRs;
+    ndk::ScopedAStatus oStatus = mAidlHal->openLogicalChannel(aid.empty() ? std::vector<uint8_t>() : aid, p2, &aidlRs);
+    if (!oStatus.isOk()) {
+        LOG(ERROR) << __func__ << ": openLogicalChannel failed: " << oStatus.getDescription();
+        return nullptr;
+    }
+
+    int channelNumber = aidlRs.channelNumber;
+    std::vector<uint8_t> selectResponse = aidlRs.selectResponse;
+    LOG(INFO) << __func__ << ": channel " << channelNumber
+              << ", select response: " << hex2string(selectResponse);
+
+    auto logicalChannel = std::make_shared<Channel>(session, this, channelNumber, selectResponse, aid, listener);
+    mChannels.insert(std::make_pair(channelNumber, logicalChannel));
+    return logicalChannel;
 }
 
 
@@ -209,8 +259,6 @@ void Terminal::closeChannel(Channel* channel) {
         LOG(WARNING) << __func__  << ": Attempt to close a null channel.";
         return;
     }
-
-    // std::lock_guard<std::mutex> lock(mLock);
 
     if (mIsConnected) {
         if (mAidlHal != nullptr) {
@@ -260,16 +308,13 @@ void Terminal::closeChannel(Channel* channel) {
 void Terminal::closeChannels() {
     LOG(INFO) << __func__;
     std::vector<std::shared_ptr<Channel>> channelsToClose;
-    {
-        //std::lock_guard<std::mutex> lock(mLock);
-        if (mChannels.empty()) {
-            LOG(INFO) << __func__ << ": No channels to close.";
-            return;
-        }
-        LOG(INFO) << __func__ << ": Preparing to close " << mChannels.size() << " channels.";
-        for (const auto& pair : mChannels) {
-            channelsToClose.push_back(pair.second);
-        }
+    if (mChannels.empty()) {
+        LOG(INFO) << __func__ << ": No channels to close.";
+        return;
+    }
+    LOG(INFO) << __func__ << ": Preparing to close " << mChannels.size() << " channels.";
+    for (const auto& pair : mChannels) {
+        channelsToClose.push_back(pair.second);
     }
 
     for (const auto& channelPtr : channelsToClose) {
@@ -282,7 +327,6 @@ void Terminal::closeChannels() {
 
 void Terminal::close() {
     LOG(INFO) << __func__;
-    //std::lock_guard<std::mutex> lock(mLock);
     if (mAidlHal != nullptr) {
         LOG(INFO) << __func__ << ": Unlinking death recipient.";
         AIBinder* binder = mAidlHal->asBinder().get();
@@ -334,15 +378,22 @@ void Terminal::handler(int event, int msg, int delay) {
     LOG(INFO) << __func__ << ": event: " << event << ", msg: " << msg << ", delay: " << delay;
     if (event == EVENT_GET_HAL) {
         LOG(INFO) << "EVENT_GET_HAL";
-        if (mName.starts_with(SecureElementService::ESE_TERMINAL)) {
-            initialize(true);
-        } else {
-            initialize(false);
+        constexpr int kMaxRetry = 5;
+        if (mGetHalRetryCount >= kMaxRetry) {
+            LOG(ERROR) << __func__ << ": giving up HAL reconnect after " << mGetHalRetryCount << " attempts";
+            return;
+        }
+        if (delay > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        }
+        ++mGetHalRetryCount;
+        initialize(mName.starts_with(SecureElementService::ESE_TERMINAL));
+        if (mIsConnected) {
+            mGetHalRetryCount = 0;
         }
     }
     if (event == EVENT_NOTIFY_STATE_CHANGE) {
         LOG(INFO) << "EVENT_NOTIFY_STATE_CHANGE";
-        //sendStateChangedBroadcast()
     }
 }
 
