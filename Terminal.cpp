@@ -17,7 +17,13 @@ using aidl::android::se::omapi::SecureElementSession;
 
 void Terminal::onClientDeath() {
     LOG(INFO) << __func__ << ": Die";
-    mIsConnected = false;
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        mIsConnected = false;
+        // Drop the dead binder proxy so the next initialize() will
+        // waitForService() again and build a fresh one.
+        mAidlHal.reset();
+    }
     this->scheduleReinitialize(GET_SERVICE_DELAY_MILLIS);
 }
 
@@ -27,7 +33,9 @@ void Terminal::onClientDeathWrapper(void* cookie) {
     self->onClientDeath();
 }
 
-// Required by NDK to avoid runtime warning; cookie is externally owned (sp<Terminal>).
+// Required by NDK to avoid a runtime warning. Cookie is a raw Terminal*
+// passed as `this` to AIBinder_linkToDeath(); the Terminal object is kept
+// alive by external sp<Terminal> holders, so there is nothing to free here.
 static void onDeathRecipientUnlinked(void* /*cookie*/) {}
 
 Terminal::AidlCallback::AidlCallback(Terminal* terminal) {
@@ -154,24 +162,42 @@ std::vector<uint8_t> Terminal::transmit(const std::vector<uint8_t>& cmd) {
     }
 }
 
-void Terminal::initialize(bool retryOnFail) {
+void Terminal::initialize(bool /*retryOnFail*/) {
     LOG(INFO) << __func__;
-    std::lock_guard<std::mutex> lock(mLock);
-    if (mAidlHal == nullptr) {
-        const std::string bName = std::string(ISecureElement::descriptor) + "/" + getName();
-        LOG(INFO) << __func__ << ": Getting Secure Element service: " << bName;
-        AIBinder* binder = AServiceManager_waitForService(bName.c_str());
-        mAidlHal = ISecureElement::fromBinder(ndk::SpAIBinder(binder));
+
+    // Fast path: if already connected, nothing to do. mLock is held briefly
+    // only to read mAidlHal safely.
+    {
+        std::lock_guard<std::mutex> lock(mLock);
         if (mAidlHal != nullptr) {
-            LOG(INFO) << __func__ << ": Successfully get SE service: " << bName;
-            mAidlHal->init(mAidlCallback);
-            AIBinder_linkToDeath(mAidlHal->asBinder().get(),
-                                mDeathRecipient, this);
-            mIsConnected = true;
-        } else {
-            LOG(ERROR) << __func__ << ": Failed to get SE service: " << bName;
+            return;
         }
     }
+
+    // waitForService() can block for a long time; do it WITHOUT mLock so
+    // that transmit/openChannel calls are not serialized behind HAL startup.
+    const std::string bName = std::string(ISecureElement::descriptor) + "/" + getName();
+    LOG(INFO) << __func__ << ": Getting Secure Element service: " << bName;
+    AIBinder* binder = AServiceManager_waitForService(bName.c_str());
+    std::shared_ptr<ISecureElement> hal = ISecureElement::fromBinder(ndk::SpAIBinder(binder));
+    if (hal == nullptr) {
+        LOG(ERROR) << __func__ << ": Failed to get SE service: " << bName;
+        return;
+    }
+
+    // Publish the fresh proxy under mLock; bail if someone else beat us.
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        if (mAidlHal != nullptr) {
+            return;
+        }
+        mAidlHal = hal;
+    }
+
+    LOG(INFO) << __func__ << ": Successfully get SE service: " << bName;
+    hal->init(mAidlCallback);
+    AIBinder_linkToDeath(hal->asBinder().get(), mDeathRecipient, this);
+    mIsConnected = true;
 }
 
 std::shared_ptr<ISecureElementReader> Terminal::newSecureElementReader(std::shared_ptr<omapi::SecureElementService> service) {
@@ -334,34 +360,40 @@ void Terminal::closeChannels() {
 
 bool Terminal::isSecureElementPresent() {
     LOG(INFO) << __func__;
-    bool p;
-    if (mAidlHal != nullptr) {
-        mAidlHal->isCardPresent(&p);
-        LOG(INFO) << __func__ << ": " << p;
-        return p;
+    std::shared_ptr<ISecureElement> hal;
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        hal = mAidlHal;
     }
-    LOG(ERROR) << __func__ << ": Can't find mAidlHal!, please init it first.";
-    return false;
+    if (hal == nullptr) {
+        LOG(ERROR) << __func__ << ": mAidlHal not ready";
+        return false;
+    }
+    bool p = false;
+    hal->isCardPresent(&p);
+    LOG(INFO) << __func__ << ": " << p;
+    return p;
 }
 
 std::vector<uint8_t> Terminal::getAtr() {
     LOG(INFO) << __func__;
     std::vector<uint8_t> atr;
-
-    if (!mIsConnected) {
+    if (!mIsConnected.load()) {
         LOG(ERROR) << "Not connected";
         return atr;
     }
-
-    if (mAidlHal != nullptr) {
-        LOG(INFO) << "Fetching atr from AIDL hal";
-        mAidlHal->getAtr(&atr);
-        if (atr.empty()) {
-            LOG(ERROR) << "Atr is empty!";
-            return atr;
-        }
-    } else {
+    std::shared_ptr<ISecureElement> hal;
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        hal = mAidlHal;
+    }
+    if (hal == nullptr) {
         LOG(ERROR) << "No AIDL hal found!";
+        return atr;
+    }
+    hal->getAtr(&atr);
+    if (atr.empty()) {
+        LOG(ERROR) << "Atr is empty!";
         return atr;
     }
     if (DEBUG) {
