@@ -88,66 +88,63 @@ std::vector<uint8_t> Terminal::transmit(const std::vector<uint8_t>& cmd) {
     LOG(INFO) << __func__;
     std::lock_guard<std::mutex> lock(mLock);
 
-    if (!mIsConnected) {
+    if (!mIsConnected.load()) {
         return {};
     }
-
     if (mAidlHal == nullptr) {
         LOG(ERROR) << __func__ << ": mAidlHal is null";
         return {};
     }
 
-    std::vector<uint8_t> response;
-    ndk::ScopedAStatus hal_status = mAidlHal->transmit(cmd, &response);
-    if (!hal_status.isOk()) {
-        LOG(ERROR) << __func__ << ": HAL transmit failed: " << hal_status.getDescription();
-        return {};
-    }
+    std::vector<uint8_t> curCmd = cmd;
 
-    if (response.size() < 2) {
-        LOG(ERROR) << "Empty or too short response in transmit()";
-        return {};
-    }
-
-    uint8_t sw1 = response[response.size() - 2];
-    uint8_t sw2 = response[response.size() - 1];
-
-    if (sw1 == 0x6C) {
-        std::vector<uint8_t> newCmd(cmd);
-        newCmd.back() = sw2;
-        std::vector<uint8_t> tmp;
-        ndk::ScopedAStatus s = mAidlHal->transmit(newCmd, &tmp);
+    while (true) {
+        std::vector<uint8_t> response;
+        ndk::ScopedAStatus s = mAidlHal->transmit(curCmd, &response);
         if (!s.isOk()) {
-            LOG(ERROR) << __func__ << ": retry after 6CXX failed: " << s.getDescription();
+            LOG(ERROR) << __func__ << ": HAL transmit failed: " << s.getDescription();
             return {};
         }
-        return tmp;
-    }
-
-    if (sw1 == 0x61) {
-        response.resize(response.size() - 2);
-        while (true) {
-            std::vector<uint8_t> getResponseCmd = {cmd[0], 0xC0, 0x00, 0x00, sw2};
-            std::vector<uint8_t> tmp;
-            ndk::ScopedAStatus s = mAidlHal->transmit(getResponseCmd, &tmp);
-            if (!s.isOk() || tmp.size() < 2) {
-                LOG(ERROR) << __func__ << ": GET RESPONSE failed";
-                return {};
-            }
-            uint8_t nextSw1 = tmp[tmp.size() - 2];
-            uint8_t nextSw2 = tmp[tmp.size() - 1];
-            response.insert(response.end(), tmp.begin(), tmp.end() - 2);
-            if (nextSw1 == 0x61) {
-                sw2 = nextSw2;
-                continue;
-            }
-            response.push_back(nextSw1);
-            response.push_back(nextSw2);
-            break;
+        if (response.size() < 2) {
+            LOG(ERROR) << __func__ << ": response too short";
+            return {};
         }
-    }
 
-    return response;
+        uint8_t sw1 = response[response.size() - 2];
+        uint8_t sw2 = response[response.size() - 1];
+
+        // 0x6CXX: wrong Le, resend with Le = SW2.
+        if (sw1 == 0x6C) {
+            curCmd.back() = sw2;
+            continue;
+        }
+
+        // 0x61XX: chained response; strip trailing SW, drain via GET RESPONSE.
+        if (sw1 == 0x61) {
+            response.resize(response.size() - 2);
+            while (true) {
+                std::vector<uint8_t> getResp = {cmd[0], 0xC0, 0x00, 0x00, sw2};
+                std::vector<uint8_t> tmp;
+                ndk::ScopedAStatus gs = mAidlHal->transmit(getResp, &tmp);
+                if (!gs.isOk() || tmp.size() < 2) {
+                    LOG(ERROR) << __func__ << ": GET RESPONSE failed";
+                    return {};
+                }
+                uint8_t nsw1 = tmp[tmp.size() - 2];
+                uint8_t nsw2 = tmp[tmp.size() - 1];
+                response.insert(response.end(), tmp.begin(), tmp.end() - 2);
+                if (nsw1 == 0x61) {
+                    sw2 = nsw2;
+                    continue;
+                }
+                response.push_back(nsw1);
+                response.push_back(nsw2);
+                return response;
+            }
+        }
+
+        return response;
+    }
 }
 
 void Terminal::initialize(bool retryOnFail) {
@@ -307,19 +304,22 @@ void Terminal::closeChannel(Channel* channel) {
 
 void Terminal::closeChannels() {
     LOG(INFO) << __func__;
-    std::vector<std::shared_ptr<Channel>> channelsToClose;
-    if (mChannels.empty()) {
-        LOG(INFO) << __func__ << ": No channels to close.";
-        return;
-    }
-    LOG(INFO) << __func__ << ": Preparing to close " << mChannels.size() << " channels.";
-    for (const auto& pair : mChannels) {
-        channelsToClose.push_back(pair.second);
+    std::vector<std::shared_ptr<Channel>> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        if (mChannels.empty()) {
+            return;
+        }
+        snapshot.reserve(mChannels.size());
+        for (const auto& pair : mChannels) {
+            snapshot.push_back(pair.second);
+        }
     }
 
-    for (const auto& channelPtr : channelsToClose) {
+    // Release lock before close(): channel->close() re-enters Terminal::closeChannel,
+    // which mutates mChannels; keeping the lock here would deadlock.
+    for (const auto& channelPtr : snapshot) {
         if (channelPtr) {
-            LOG(INFO) << __func__ << ": Requesting close for channel " << channelPtr->getChannelNumber();
             channelPtr->close();
         }
     }
@@ -374,27 +374,30 @@ std::vector<uint8_t> Terminal::getAtr() {
     return atr;
 }
 
-void Terminal::handler(int event, int msg, int delay) {
-    LOG(INFO) << __func__ << ": event: " << event << ", msg: " << msg << ", delay: " << delay;
-    if (event == EVENT_GET_HAL) {
-        LOG(INFO) << "EVENT_GET_HAL";
-        constexpr int kMaxRetry = 5;
-        if (mGetHalRetryCount >= kMaxRetry) {
-            LOG(ERROR) << __func__ << ": giving up HAL reconnect after " << mGetHalRetryCount << " attempts";
-            return;
-        }
+void Terminal::handler(int event, int /*msg*/, int delay) {
+    if (event != EVENT_GET_HAL) {
+        return;
+    }
+    constexpr int kMaxRetry = 5;
+    if (mGetHalRetryCount.load() >= kMaxRetry) {
+        LOG(ERROR) << __func__ << ": giving up HAL reconnect after "
+                   << mGetHalRetryCount.load() << " attempts";
+        return;
+    }
+
+    // Offload to a detached thread so binder death-recipient/state-change callbacks
+    // are not blocked by waitForService and sleep_for.
+    ::android::sp<Terminal> self(this);
+    std::thread([self, delay]() {
         if (delay > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(delay));
         }
-        ++mGetHalRetryCount;
-        initialize(mName.starts_with(SecureElementService::ESE_TERMINAL));
-        if (mIsConnected) {
-            mGetHalRetryCount = 0;
+        self->mGetHalRetryCount.fetch_add(1);
+        self->initialize(self->mName.starts_with(SecureElementService::ESE_TERMINAL));
+        if (self->mIsConnected.load()) {
+            self->mGetHalRetryCount.store(0);
         }
-    }
-    if (event == EVENT_NOTIFY_STATE_CHANGE) {
-        LOG(INFO) << "EVENT_NOTIFY_STATE_CHANGE";
-    }
+    }).detach();
 }
 
 }

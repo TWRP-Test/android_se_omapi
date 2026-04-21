@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include <aidl/android/se/omapi/BnSecureElementSession.h>
 #include <aidl/android/se/omapi/ISecureElementChannel.h>
 #include <aidl/android/se/omapi/ISecureElementListener.h>
@@ -42,7 +44,7 @@ class SecureElementSession : public BnSecureElementSession {
         std::weak_ptr<SecureElementReader> mReader;
         std::vector<std::shared_ptr<Channel>> mChannels;
         std::mutex mLock;
-        bool mIsClosed = false;
+        std::atomic<bool> mIsClosed{false};
         std::vector<uint8_t> mAtr;
 };
 }  // namespace aidl::android::se::omapi

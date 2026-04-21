@@ -23,33 +23,16 @@ int Channel::getChannelNumber() const {
 
 void Channel::close() {
     LOG(INFO) << __func__;
-    bool alreadyClosed = false;
-    {
-        if (mIsClosed) {
-            alreadyClosed = true;
-        } else {
-            mIsClosed = true;
-        }
-    }
-    if (alreadyClosed) {
+    if (mIsClosed.exchange(true)) {
         return;
     }
     if (mTerminal) {
         mTerminal->closeChannel(this);
-    } else {
-        LOG(ERROR) << "Channel " << mChannelNumber << ": Terminal is null, cannot perform terminal-level close.";
     }
     if (mSession != nullptr) {
-        aidl::android::se::omapi::SecureElementSession* concreteSession =
+        auto* concreteSession =
             static_cast<aidl::android::se::omapi::SecureElementSession*>(mSession);
-        
-        if (concreteSession) {
-            concreteSession->removeChannel(this); 
-        } else {
-            LOG(ERROR) << "Channel " << mChannelNumber << ": Failed to cast mSession to SecureElementSession for removeChannel call.";
-        }
-    } else {
-        LOG(WARNING) << "Channel " << mChannelNumber << ": Session is null, cannot remove channel from session.";
+        concreteSession->removeChannel(this);
     }
 }
 
@@ -60,20 +43,6 @@ std::vector<uint8_t> Channel::getSelectResponse() {
 std::vector<uint8_t> Channel::transmit(const std::vector<uint8_t>& command) {
     if (command.size() < 4) {
         LOG(ERROR) << "Channel " << mChannelNumber << ": APDU too short";
-        return {};
-    }
-
-    const uint8_t cla = command[0];
-    const uint8_t ins = command[1];
-
-    // Block MANAGE CHANNEL (OMAPI/SEAC).
-    if (ins == 0x70) {
-        LOG(ERROR) << "Channel " << mChannelNumber << ": MANAGE CHANNEL blocked";
-        return {};
-    }
-    // Block ISO-reserved CLA=0xFF with INS 0x6X/0x9X.
-    if (cla == 0xFF && ((ins & 0xF0) == 0x60 || (ins & 0xF0) == 0x90)) {
-        LOG(ERROR) << "Channel " << mChannelNumber << ": reserved CLA/INS blocked";
         return {};
     }
 
@@ -116,8 +85,7 @@ bool Channel::isBasicChannel() {
 }
 
 bool Channel::isClosed() {
-    LOG(INFO) << __func__ << ": " << mIsClosed;
-    return mIsClosed;
+    return mIsClosed.load();
 }
 
 uint8_t Channel::internalGetModifiedCla(uint8_t originalCla, int channelNumber) const {
@@ -241,7 +209,31 @@ ndk::ScopedAStatus SecureElementChannel::getSelectResponse(std::vector<uint8_t>*
 
 ndk::ScopedAStatus SecureElementChannel::transmit(const std::vector<uint8_t>& command, std::vector<uint8_t>* outResponse) {
     LOG(INFO) << __func__;
-    *outResponse = mChannel->transmit(command);
+    outResponse->clear();
+
+    if (command.size() < 4) {
+        return ndk::ScopedAStatus::fromExceptionCodeWithMessage(
+                EX_ILLEGAL_ARGUMENT, "APDU too short");
+    }
+    const uint8_t cla = command[0];
+    const uint8_t ins = command[1];
+    // Block MANAGE CHANNEL (OMAPI/SEAC).
+    if (ins == 0x70) {
+        return ndk::ScopedAStatus::fromExceptionCodeWithMessage(
+                EX_SECURITY, "MANAGE CHANNEL blocked");
+    }
+    // Block ISO-reserved CLA=0xFF with INS 0x6X/0x9X.
+    if (cla == 0xFF && ((ins & 0xF0) == 0x60 || (ins & 0xF0) == 0x90)) {
+        return ndk::ScopedAStatus::fromExceptionCodeWithMessage(
+                EX_SECURITY, "Reserved CLA/INS blocked");
+    }
+
+    std::vector<uint8_t> response = mChannel->transmit(command);
+    if (response.empty()) {
+        return ndk::ScopedAStatus::fromServiceSpecificErrorWithMessage(
+                -1, "HAL transmit failed");
+    }
+    *outResponse = std::move(response);
     return ndk::ScopedAStatus::ok();
 }
 

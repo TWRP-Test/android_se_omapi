@@ -10,8 +10,9 @@
 using aidl::android::se::omapi::SecureElementService;
 
 namespace {
+// Async-signal-safe: _exit is listed in signal-safety(7); no logging/allocation.
 void handleTerminationSignal(int sig) {
-    LOG(INFO) << "Caught signal " << sig << ", exiting";
+    (void)sig;
     _exit(0);
 }
 }  // namespace

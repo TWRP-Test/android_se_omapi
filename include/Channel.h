@@ -1,10 +1,10 @@
 #pragma once
 
+#include <atomic>
+
 #include <aidl/android/se/omapi/BnSecureElementChannel.h>
 #include <aidl/android/se/omapi/ISecureElementListener.h>
 #include <aidl/android/se/omapi/ISecureElementSession.h>
-
-#include <utils/RefBase.h>
 
 #include "Terminal.h"
 
@@ -14,7 +14,7 @@ using aidl::android::se::omapi::ISecureElementSession;
 
 namespace aidl::android::se {
 
-class Channel : public ::android::RefBase {
+class Channel {
     public:
         Channel(ISecureElementSession* session,
             Terminal* terminal,
@@ -23,7 +23,7 @@ class Channel : public ::android::RefBase {
             const std::vector<uint8_t>& aid,
             const std::shared_ptr<ISecureElementListener>& listener);
 
-        virtual ~Channel() = default;
+        ~Channel() = default;
 
         void close();
         std::vector<uint8_t> transmit(const std::vector<uint8_t>& command);
@@ -40,7 +40,7 @@ class Channel : public ::android::RefBase {
         std::vector<uint8_t> mAid;
         const std::shared_ptr<ISecureElementListener> mListener;
         uint8_t internalGetModifiedCla(uint8_t originalCla, int channelNumber) const;
-        bool mIsClosed = false;
+        std::atomic<bool> mIsClosed{false};
         friend class SecureElementChannel;
     };
     class SecureElementChannel : public BnSecureElementChannel {

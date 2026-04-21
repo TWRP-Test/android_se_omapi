@@ -62,8 +62,8 @@ private:
     std::string mName;
     std::map<int, std::shared_ptr<Channel>> mChannels;
     std::mutex mLock;
-    bool mIsConnected = false;
-    int mGetHalRetryCount = 0;
+    std::atomic<bool> mIsConnected{false};
+    std::atomic<int> mGetHalRetryCount{0};
     std::shared_ptr<ISecureElement> mAidlHal;
 
     class AidlCallback : public BnSecureElementCallback {

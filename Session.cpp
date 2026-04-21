@@ -18,6 +18,11 @@ SecureElementSession::~SecureElementSession() = default;
 
 ::ndk::ScopedAStatus SecureElementSession::getReader(std::shared_ptr<ISecureElementReader>* outReader) {
     auto r = mReader.lock();
+    if (r == nullptr) {
+        *outReader = nullptr;
+        return ::ndk::ScopedAStatus::fromExceptionCodeWithMessage(
+                EX_ILLEGAL_STATE, "Reader is gone");
+    }
     *outReader = std::static_pointer_cast<ISecureElementReader>(r);
     return ::ndk::ScopedAStatus::ok();
 }
@@ -29,12 +34,13 @@ SecureElementSession::~SecureElementSession() = default;
 
 ::ndk::ScopedAStatus SecureElementSession::close() {
     LOG(INFO) << __func__;
+    if (mIsClosed.exchange(true)) {
+        return ::ndk::ScopedAStatus::ok();
+    }
     closeChannels();
     if (auto r = mReader.lock()) {
         r->removeSession(this);
     }
-    std::lock_guard<std::mutex> lock(mLock);
-    mIsClosed = true;
     return ::ndk::ScopedAStatus::ok();
 }
 
@@ -70,8 +76,7 @@ SecureElementSession::~SecureElementSession() = default;
 
 ::ndk::ScopedAStatus SecureElementSession::isClosed(bool* isClosed) {
     LOG(INFO) << __func__;
-    std::lock_guard<std::mutex> lock(mLock);
-    *isClosed = mIsClosed;
+    *isClosed = mIsClosed.load();
     return ::ndk::ScopedAStatus::ok();
 }
 
