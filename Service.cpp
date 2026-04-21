@@ -57,8 +57,10 @@ namespace aidl::android::se::omapi {
         ::android::sp<Terminal> terminal = new Terminal(name);
         mTerminals.insert({name, terminal});
         // Initialize HAL asynchronously so main() can register this service
-        // without waiting for waitForService(). Clients get EX_ILLEGAL_STATE
-        // on HAL-dependent calls until mIsConnected flips to true.
+        // without waiting for waitForService(). Until mIsConnected flips to
+        // true, HAL-dependent calls return their per-API failure shape:
+        // openSession -> EX_ILLEGAL_STATE; open{Basic,Logical}Channel ->
+        // EX_SERVICE_SPECIFIC "Failed to open..."; getAtr -> empty vector.
         std::thread([terminal]() { terminal->initialize(true); }).detach();
     }
 }

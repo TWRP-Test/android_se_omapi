@@ -78,14 +78,12 @@ private:
 
     const bool DEBUG = true;
 
-    const int GET_SERVICE_DELAY_MILLIS = 4 * 1000;
-    const int EVENT_GET_HAL = 1;
-    const int EVENT_NOTIFY_STATE_CHANGE = 2;
+    static constexpr int GET_SERVICE_DELAY_MILLIS = 4 * 1000;
 
     AIBinder_DeathRecipient* mDeathRecipient;
     std::shared_ptr<AidlCallback> mAidlCallback;
 
-    void handler(int event, int msg, int delay);
+    void scheduleReinitialize(int delayMs);
     
     friend class SecureElementReader;
 };

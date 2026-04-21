@@ -18,7 +18,7 @@ using aidl::android::se::omapi::SecureElementSession;
 void Terminal::onClientDeath() {
     LOG(INFO) << __func__ << ": Die";
     mIsConnected = false;
-    this->handler(EVENT_GET_HAL, 0, GET_SERVICE_DELAY_MILLIS);
+    this->scheduleReinitialize(GET_SERVICE_DELAY_MILLIS);
 }
 
 void Terminal::onClientDeathWrapper(void* cookie) {
@@ -87,7 +87,8 @@ void Terminal::stateChange(bool state, const std::string& reason) {
         this->closeChannels();
         mDefaultApplicationSelectedOnBasicChannel = true;
     }
-    this->handler(EVENT_NOTIFY_STATE_CHANGE, state, 0);
+    // No state-change broadcast in recovery; the original APK's
+    // sendStateChangedBroadcast path is intentionally dropped.
 }
 
 std::vector<uint8_t> Terminal::transmit(const std::vector<uint8_t>& cmd) {
@@ -369,10 +370,7 @@ std::vector<uint8_t> Terminal::getAtr() {
     return atr;
 }
 
-void Terminal::handler(int event, int /*msg*/, int delay) {
-    if (event != EVENT_GET_HAL) {
-        return;
-    }
+void Terminal::scheduleReinitialize(int delayMs) {
     constexpr int kMaxRetry = 5;
     if (mGetHalRetryCount.load() >= kMaxRetry) {
         LOG(ERROR) << __func__ << ": giving up HAL reconnect after "
@@ -380,12 +378,12 @@ void Terminal::handler(int event, int /*msg*/, int delay) {
         return;
     }
 
-    // Offload to a detached thread so binder death-recipient/state-change callbacks
-    // are not blocked by waitForService and sleep_for.
+    // Offload to a detached thread so the binder death-recipient callback
+    // thread is not blocked by waitForService and the retry sleep.
     ::android::sp<Terminal> self(this);
-    std::thread([self, delay]() {
-        if (delay > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    std::thread([self, delayMs]() {
+        if (delayMs > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
         }
         self->mGetHalRetryCount.fetch_add(1);
         self->initialize(self->mName.starts_with(SecureElementService::ESE_TERMINAL));
