@@ -205,7 +205,7 @@ std::shared_ptr<ISecureElementReader> Terminal::newSecureElementReader(std::shar
     return ndk::SharedRefBase::make<SecureElementReader>(service, ::android::sp<Terminal>(this));
 }
 
-std::shared_ptr<Channel> Terminal::openBasicChannel(ISecureElementSession* session, const std::vector<uint8_t>& aid, uint8_t p2, const std::shared_ptr<ISecureElementListener>& listener) {
+std::shared_ptr<Channel> Terminal::openBasicChannel(std::weak_ptr<omapi::SecureElementSession> session, const std::vector<uint8_t>& aid, uint8_t p2, const std::shared_ptr<ISecureElementListener>& listener) {
     LOG(INFO) << __func__;
     if (!aid.empty() && (aid.size() < 5 || aid.size() > 16)) {
         LOG(ERROR) << __func__ << ": AID out of range";
@@ -236,13 +236,13 @@ std::shared_ptr<Channel> Terminal::openBasicChannel(ISecureElementSession* sessi
     }
 
     LOG(INFO) << __func__ << ": basic channel opened, select response: " << hex2string(selectResponse);
-    auto basicChannel = std::make_shared<Channel>(session, this, 0, selectResponse, aid, listener);
+    auto basicChannel = std::make_shared<Channel>(std::move(session), this, 0, selectResponse, aid, listener);
     mChannels.insert(std::make_pair(0, basicChannel));
     mDefaultApplicationSelectedOnBasicChannel = false;
     return basicChannel;
 }
 
-std::shared_ptr<Channel> Terminal::openLogicalChannel(ISecureElementSession* session, const std::vector<uint8_t>& aid, uint8_t p2, const std::shared_ptr<ISecureElementListener>& listener) {
+std::shared_ptr<Channel> Terminal::openLogicalChannel(std::weak_ptr<omapi::SecureElementSession> session, const std::vector<uint8_t>& aid, uint8_t p2, const std::shared_ptr<ISecureElementListener>& listener) {
     LOG(INFO) << __func__;
     if (!aid.empty() && (aid.size() < 5 || aid.size() > 16)) {
         LOG(ERROR) << __func__ << ": AID out of range";
@@ -271,7 +271,7 @@ std::shared_ptr<Channel> Terminal::openLogicalChannel(ISecureElementSession* ses
     LOG(INFO) << __func__ << ": channel " << channelNumber
               << ", select response: " << hex2string(selectResponse);
 
-    auto logicalChannel = std::make_shared<Channel>(session, this, channelNumber, selectResponse, aid, listener);
+    auto logicalChannel = std::make_shared<Channel>(std::move(session), this, channelNumber, selectResponse, aid, listener);
     mChannels.insert(std::make_pair(channelNumber, logicalChannel));
     return logicalChannel;
 }
@@ -279,6 +279,9 @@ std::shared_ptr<Channel> Terminal::openLogicalChannel(ISecureElementSession* ses
 
 bool Terminal::reset() {
     LOG(INFO) << __func__;
+    // TWRP recovery: SE reader.reset() is unsupported. The ISecureElement HAL
+    // exposes no reset entry point, and recovery has no privileged caller path
+    // that would legitimately request one.
     return true;
 }
 
@@ -289,6 +292,10 @@ void Terminal::closeChannel(Channel* channel) {
         LOG(WARNING) << __func__  << ": Attempt to close a null channel.";
         return;
     }
+
+    // Serialize HAL closeChannel and mChannels mutation against
+    // transmit/openBasicChannel/openLogicalChannel, which all hold mLock.
+    std::lock_guard<std::mutex> lock(mLock);
 
     if (mIsConnected) {
         if (mAidlHal != nullptr) {

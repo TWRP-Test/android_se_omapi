@@ -1,8 +1,6 @@
 #include "Service.h"
 #include "Terminal.h"
 
-#include <thread>
-
 namespace aidl::android::se::omapi {
     SecureElementService::SecureElementService() {
         createTerminals();
@@ -56,11 +54,10 @@ namespace aidl::android::se::omapi {
         const std::string name = std::string(ESE_TERMINAL) + "1";
         ::android::sp<Terminal> terminal = new Terminal(name);
         mTerminals.insert({name, terminal});
-        // Initialize HAL asynchronously so main() can register this service
-        // without waiting for waitForService(). Until mIsConnected flips to
-        // true, HAL-dependent calls return their per-API failure shape:
-        // openSession -> EX_ILLEGAL_STATE; open{Basic,Logical}Channel ->
-        // EX_SERVICE_SPECIFIC "Failed to open..."; getAtr -> empty vector.
-        std::thread([terminal]() { terminal->initialize(true); }).detach();
+        // Match upstream Java SecureElementService.onCreate(): block in the
+        // service-creation path until the SE HAL is connected. Otherwise the
+        // first openSession() race after addService() returns
+        // EX_ILLEGAL_STATE before the HAL has even bound.
+        terminal->initialize(true);
     }
 }
