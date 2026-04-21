@@ -1,6 +1,8 @@
 #include "Service.h"
 #include "Terminal.h"
 
+#include <thread>
+
 namespace aidl::android::se::omapi {
     SecureElementService::SecureElementService() {
         createTerminals();
@@ -53,7 +55,10 @@ namespace aidl::android::se::omapi {
     void SecureElementService::createTerminals() {
         const std::string name = std::string(ESE_TERMINAL) + "1";
         ::android::sp<Terminal> terminal = new Terminal(name);
-        terminal->initialize(true);
         mTerminals.insert({name, terminal});
+        // Initialize HAL asynchronously so main() can register this service
+        // without waiting for waitForService(). Clients get EX_ILLEGAL_STATE
+        // on HAL-dependent calls until mIsConnected flips to true.
+        std::thread([terminal]() { terminal->initialize(true); }).detach();
     }
 }

@@ -27,6 +27,9 @@ void Terminal::onClientDeathWrapper(void* cookie) {
     self->onClientDeath();
 }
 
+// Required by NDK to avoid runtime warning; cookie is externally owned (sp<Terminal>).
+static void onDeathRecipientUnlinked(void* /*cookie*/) {}
+
 Terminal::AidlCallback::AidlCallback(Terminal* terminal) {
     mTerminal = terminal;
 }
@@ -48,6 +51,7 @@ void Terminal::AidlCallback::clearTerminal() {
 Terminal::Terminal(const std::string name) {
     mName = name;
     mDeathRecipient = AIBinder_DeathRecipient_new(onClientDeathWrapper);
+    AIBinder_DeathRecipient_setOnUnlinked(mDeathRecipient, onDeathRecipientUnlinked);
     mAidlCallback = ndk::SharedRefBase::make<AidlCallback>(this);
 }
 
@@ -78,6 +82,8 @@ void Terminal::stateChange(bool state, const std::string& reason) {
         LOG(INFO) << "state: not connected";
     } else {
         LOG(INFO) << "state: connected";
+        // On (re)connect, purge stale local channel entries — they are
+        // no longer valid on the HAL side. Matches original Terminal.java.
         this->closeChannels();
         mDefaultApplicationSelectedOnBasicChannel = true;
     }
@@ -321,17 +327,6 @@ void Terminal::closeChannels() {
     for (const auto& channelPtr : snapshot) {
         if (channelPtr) {
             channelPtr->close();
-        }
-    }
-}
-
-void Terminal::close() {
-    LOG(INFO) << __func__;
-    if (mAidlHal != nullptr) {
-        LOG(INFO) << __func__ << ": Unlinking death recipient.";
-        AIBinder* binder = mAidlHal->asBinder().get();
-        if (binder) {
-            AIBinder_unlinkToDeath(binder, mDeathRecipient, this);
         }
     }
 }

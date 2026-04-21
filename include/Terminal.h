@@ -44,7 +44,6 @@ public:
     void initialize(bool retryOnFail);
     void closeChannel(Channel* channel);
     void closeChannels();
-    void close();
     std::string getName() const;
     std::vector<uint8_t> getAtr();
     std::shared_ptr<Channel> openBasicChannel(ISecureElementSession* session, const std::vector<uint8_t>& aid, uint8_t p2, const std::shared_ptr<ISecureElementListener>& listener);
