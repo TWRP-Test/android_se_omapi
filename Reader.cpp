@@ -23,11 +23,20 @@ using aidl::android::se::omapi::SecureElementSession;
 
     ::ndk::ScopedAStatus SecureElementReader::closeSessions() {
         LOG(INFO) << __PRETTY_FUNCTION__;
-        std::lock_guard<std::mutex> lock(mLock);
-        for (auto& cSession : mSessions) {
-                cSession->close();
+        // Snapshot + unlock before calling Session::close(): close() re-enters
+        // removeSession() which also takes mLock, so holding it here would
+        // self-deadlock on a non-recursive std::mutex.
+        std::vector<std::shared_ptr<SecureElementSession>> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(mLock);
+            snapshot = std::move(mSessions);
+            mSessions.clear();
         }
-        mSessions.clear();
+        for (auto& cSession : snapshot) {
+            if (cSession) {
+                cSession->close();
+            }
+        }
         return ::ndk::ScopedAStatus::ok();
     }
 
